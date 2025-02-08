@@ -261,13 +261,13 @@ func processImageFields(r io.Reader) ([]byte, error) {
 		}
 	}
 
-	// 确保请求体包含必要的字段
-	if _, ok := reqData["model"]; !ok {
-		reqData["model"] = "gpt-4-vision-preview"
-	}
-	if _, ok := reqData["max_tokens"]; !ok {
-		reqData["max_tokens"] = 4096
-	}
+	// // 确保请求体包含必要的字段
+	// if _, ok := reqData["model"]; !ok {
+	// 	reqData["model"] = "gpt-4-vision-preview"
+	// }
+	// if _, ok := reqData["max_tokens"]; !ok {
+	// 	reqData["max_tokens"] = 4096
+	// }
 
 	return json.Marshal(reqData)
 }
