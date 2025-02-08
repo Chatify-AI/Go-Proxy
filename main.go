@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,7 +30,18 @@ var (
 	imageRecords    = make(map[string]time.Time)
 	imageRecordsMux sync.Mutex
 	localAPIURL     = "http://host.docker.internal:3000" // 默认使用 host.docker.internal
+	imageCounter    uint64                               // 添加计数器
+
+	// 图片记录优化
+	imageTimeList = make([]*ImageRecord, 0, 1000) // 预分配容量
+	imageListMux  sync.Mutex
 )
+
+// ImageRecord 图片记录结构
+type ImageRecord struct {
+	FileName   string
+	CreateTime time.Time
+}
 
 func init() {
 	// 如果环境变量中设置了 LOCAL_API_URL，则使用环境变量的值
@@ -175,16 +187,17 @@ func parseProxyToken(token string) (config ProxyConfig, ok bool) {
 	return ProxyConfig{}, false
 }
 
-func processImageFields(body []byte) ([]byte, error) {
+func processImageFields(r io.Reader) ([]byte, error) {
 	var reqData map[string]interface{}
-	if err := json.Unmarshal(body, &reqData); err != nil {
+	decoder := json.NewDecoder(r)
+	if err := decoder.Decode(&reqData); err != nil {
 		log.Printf("[ERROR] Failed to parse request body: %v", err)
-		return body, nil
+		return nil, err
 	}
 
 	messages, ok := reqData["messages"].([]interface{})
 	if !ok {
-		return body, nil
+		return json.Marshal(reqData)
 	}
 
 	for _, m := range messages {
@@ -263,18 +276,18 @@ func processImageFields(body []byte) ([]byte, error) {
 func downloadImage(urlStr string) ([]byte, error) {
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request")
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 	req.Header.Set("User-Agent", UserAgent)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("download failed")
+		return nil, fmt.Errorf("failed to download image: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("image download failed with status: %d", resp.StatusCode)
 	}
 
 	return io.ReadAll(resp.Body)
@@ -293,22 +306,31 @@ func decodeBase64Image(dataURL string) ([]byte, error) {
 // 保存图片到本地
 func saveImageLocally(data []byte) (string, error) {
 	imagePath := os.Getenv("IMAGE_STORAGE_PATH")
-	fileName := fmt.Sprintf("img_%d.jpg", time.Now().UnixNano())
+	counter := atomic.AddUint64(&imageCounter, 1)
+	fileName := fmt.Sprintf("img_%d_%d.jpg", time.Now().UnixNano(), counter)
 	filePath := filepath.Join(imagePath, fileName)
 
 	if err := os.WriteFile(filePath, data, 0666); err != nil {
-		return "", fmt.Errorf("写入失败")
+		return "", fmt.Errorf("failed to write image file: %v", err)
 	}
 
+	now := time.Now()
 	imageRecordsMux.Lock()
-	imageRecords[fileName] = time.Now()
+	imageRecords[fileName] = now
 	imageRecordsMux.Unlock()
+
+	imageListMux.Lock()
+	imageTimeList = append(imageTimeList, &ImageRecord{
+		FileName:   fileName,
+		CreateTime: now,
+	})
+	imageListMux.Unlock()
 
 	// 使用公网 IP 和端口生成 URL
 	publicIP := os.Getenv("PUBLIC_IP")
 	if publicIP == "" {
 		log.Printf("[ERROR] PUBLIC_IP environment variable is not set")
-		return "", fmt.Errorf("PUBLIC_IP not set")
+		return "", fmt.Errorf("PUBLIC_IP environment variable is not set")
 	}
 
 	newURL := fmt.Sprintf("http://%s:%s/images/%s",
@@ -316,39 +338,40 @@ func saveImageLocally(data []byte) (string, error) {
 		os.Getenv("SERVER_PORT"),
 		fileName)
 
-	log.Printf("[INFO] Image saved: %s, URL: %s", fileName, newURL)
+	log.Printf("[INFO] Image saved: %s", fileName)
 	return newURL, nil
 }
 
-func streamResponse(w http.ResponseWriter, resp *http.Response) error {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		for k, v := range resp.Header {
-			for _, vv := range v {
-				w.Header().Add(k, vv)
-			}
-		}
+// 转发响应到客户端
+func forwardResponse(w http.ResponseWriter, resp *http.Response) error {
+	// 尝试获取 flusher，判断是否支持流式响应
+	flusher, canFlush := w.(http.Flusher)
+
+	// 复制响应头
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+
+	// 如果不支持流式响应，使用普通响应
+	if !canFlush {
 		w.WriteHeader(resp.StatusCode)
 		_, err := io.Copy(w, resp.Body)
 		return err
 	}
 
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.Header().Del("Content-Length")
+	// 流式响应处理
+	w.Header().Del("Content-Length") // 流式响应不需要 Content-Length
 	w.WriteHeader(resp.StatusCode)
 	flusher.Flush()
 
 	reader := bufio.NewReader(resp.Body)
 	buf := make([]byte, 4096)
+
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			_, werr := w.Write(buf[:n])
-			if werr != nil {
-				log.Printf("[ERROR] Write failed: %v", werr)
-				return werr
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return fmt.Errorf("写入响应失败: %v", werr)
 			}
 			flusher.Flush()
 		}
@@ -356,8 +379,7 @@ func streamResponse(w http.ResponseWriter, resp *http.Response) error {
 			if err == io.EOF {
 				return nil
 			}
-			log.Printf("[ERROR] Read failed: %v", err)
-			return err
+			return fmt.Errorf("读取响应失败: %v", err)
 		}
 	}
 }
@@ -404,12 +426,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request, parseAuth func(s
 }
 
 func readAndProcessRequestBody(r *http.Request) ([]byte, error) {
-	bodyData, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取请求体失败: %v", err)
-	}
-
-	return processImageFields(bodyData)
+	return processImageFields(r.Body)
 }
 
 func forwardRequest(w http.ResponseWriter, r *http.Request, config ProxyConfig, bodyData []byte) error {
@@ -439,14 +456,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, config ProxyConfig, 
 	}
 	defer resp.Body.Close()
 
-	// 如果状态码不是 200，打印响应体
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[ERROR] Upstream error: %d - %s", resp.StatusCode, string(respBody))
-		resp.Body = io.NopCloser(bytes.NewBuffer(respBody))
-	}
-
-	// 处理响应
+	// 处理非 200 状态码
 	if resp.StatusCode != http.StatusOK {
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
@@ -459,31 +469,45 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, config ProxyConfig, 
 		return nil
 	}
 
-	return streamResponse(w, resp)
+	return forwardResponse(w, resp)
 }
 
 func cleanupImages() {
 	for {
 		time.Sleep(1 * time.Minute)
 		now := time.Now()
+		threshold := now.Add(-5 * time.Minute)
 
-		imageRecordsMux.Lock()
-		for fileName, createTime := range imageRecords {
-			if now.Sub(createTime) > 5*time.Minute {
-				imagePath := os.Getenv("IMAGE_STORAGE_PATH")
-				if imagePath == "" {
-					imagePath = filepath.Join("/data", "images")
-				}
-				path := filepath.Join(imagePath, fileName)
-				if err := os.Remove(path); err == nil {
-					log.Printf("[INFO] Cleaned: %s", fileName)
-				} else {
-					log.Printf("[ERROR] Failed to delete: %s", fileName)
-				}
-				delete(imageRecords, fileName)
+		imageListMux.Lock()
+		// 找到第一个不需要删除的索引
+		cutIndex := 0
+		for i, record := range imageTimeList {
+			if record.CreateTime.After(threshold) {
+				cutIndex = i
+				break
+			}
+
+			// 删除文件
+			imagePath := os.Getenv("IMAGE_STORAGE_PATH")
+			if imagePath == "" {
+				imagePath = filepath.Join("/data", "images")
+			}
+			path := filepath.Join(imagePath, record.FileName)
+
+			imageRecordsMux.Lock()
+			delete(imageRecords, record.FileName)
+			imageRecordsMux.Unlock()
+
+			if err := os.Remove(path); err == nil {
+				log.Printf("[INFO] Cleaned: %s", record.FileName)
 			}
 		}
-		imageRecordsMux.Unlock()
+
+		// 移除已处理的记录
+		if cutIndex > 0 {
+			imageTimeList = imageTimeList[cutIndex:]
+		}
+		imageListMux.Unlock()
 	}
 }
 
