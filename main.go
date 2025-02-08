@@ -23,6 +23,9 @@ const (
 	DefaultTimeout = 300 * time.Second
 	UserAgent      = "IPS/1.0"
 	DefaultPort    = "2888"
+	ipInfoURL      = "https://ipinfo.io/ip"
+	ipifyURL       = "https://api.ipify.org"
+	ipAPIURL       = "https://api.ipapi.com/api/check?access_key=free"
 )
 
 // 全局变量
@@ -303,6 +306,49 @@ func decodeBase64Image(dataURL string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(parts[1])
 }
 
+// 添加获取公网 IP 的函数
+func getPublicIP() string {
+	// 首先检查环境变量
+	if ip := os.Getenv("PUBLIC_IP"); ip != "" {
+		return ip
+	}
+
+	// 尝试多个服务获取公网 IP
+	urls := []string{ipInfoURL, ipifyURL}
+	
+	for _, url := range urls {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
+		
+		req.Header.Set("User-Agent", UserAgent)
+		client := &http.Client{Timeout: 5 * time.Second}
+		
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == http.StatusOK {
+			ip, err := io.ReadAll(resp.Body)
+			if err != nil {
+				continue
+			}
+			// 清理返回的 IP（去除空格和换行符）
+			cleanIP := strings.TrimSpace(string(ip))
+			if cleanIP != "" {
+				return cleanIP
+			}
+		}
+	}
+
+	// 如果所有方法都失败，返回 localhost
+	log.Printf("[WARN] Failed to get public IP, using localhost")
+	return "localhost"
+}
+
 // 保存图片到本地
 func saveImageLocally(data []byte) (string, error) {
 	imagePath := os.Getenv("IMAGE_STORAGE_PATH")
@@ -326,13 +372,9 @@ func saveImageLocally(data []byte) (string, error) {
 	})
 	imageListMux.Unlock()
 
-	// 使用公网 IP 和端口生成 URL
-	publicIP := os.Getenv("PUBLIC_IP")
-	if publicIP == "" {
-		log.Printf("[ERROR] PUBLIC_IP environment variable is not set")
-		return "", fmt.Errorf("PUBLIC_IP environment variable is not set")
-	}
-
+	// 使用新的获取公网 IP 的方法
+	publicIP := getPublicIP()
+	
 	newURL := fmt.Sprintf("http://%s:%s/images/%s",
 		publicIP,
 		os.Getenv("SERVER_PORT"),
