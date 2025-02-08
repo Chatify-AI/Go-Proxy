@@ -500,14 +500,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, config ProxyConfig, 
 
 	// 处理非 200 状态码
 	if resp.StatusCode != http.StatusOK {
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
-			writeJSONError(w, resp.StatusCode, "azure_auth")
-		case http.StatusTooManyRequests:
-			writeJSONError(w, resp.StatusCode, "") // 使用默认的 429 错误
-		default:
-			writeJSONError(w, resp.StatusCode, "azure_image")
-		}
+		writeJSONError(w, http.StatusTooManyRequests, "")
 		return nil
 	}
 
