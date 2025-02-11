@@ -46,6 +46,42 @@ type ImageRecord struct {
 	CreateTime time.Time
 }
 
+// OrderedResponse 定义响应结构体以确保字段顺序
+type OrderedResponse struct {
+	ID                string                 `json:"id"`
+	Object            string                 `json:"object"`
+	Created           int64                  `json:"created"`
+	Model             string                 `json:"model"`
+	Choices           []interface{}          `json:"choices"`
+	Usage             map[string]interface{} `json:"usage"`
+	ServiceTier       string                 `json:"service_tier,omitempty"`
+	SystemFingerprint string                 `json:"system_fingerprint"`
+}
+
+// reorderResponse 重新排序响应字段
+func reorderResponse(data []byte) ([]byte, error) {
+	var original map[string]interface{}
+	if err := json.Unmarshal(data, &original); err != nil {
+		return nil, err
+	}
+
+	ordered := OrderedResponse{
+		ID:                original["id"].(string),
+		Object:            original["object"].(string),
+		Created:           int64(original["created"].(float64)),
+		Model:             original["model"].(string),
+		Choices:           original["choices"].([]interface{}),
+		Usage:             original["usage"].(map[string]interface{}),
+		SystemFingerprint: original["system_fingerprint"].(string),
+	}
+
+	if serviceTier, ok := original["service_tier"].(string); ok {
+		ordered.ServiceTier = serviceTier
+	}
+
+	return json.Marshal(ordered)
+}
+
 func init() {
 	// 如果环境变量中设置了 LOCAL_API_URL，则使用环境变量的值
 	if url := os.Getenv("LOCAL_API_URL"); url != "" {
@@ -315,22 +351,22 @@ func getPublicIP() string {
 
 	// 尝试多个服务获取公网 IP
 	urls := []string{ipInfoURL, ipifyURL}
-	
+
 	for _, url := range urls {
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			continue
 		}
-		
+
 		req.Header.Set("User-Agent", UserAgent)
 		client := &http.Client{Timeout: 5 * time.Second}
-		
+
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
 		}
 		defer resp.Body.Close()
-		
+
 		if resp.StatusCode == http.StatusOK {
 			ip, err := io.ReadAll(resp.Body)
 			if err != nil {
@@ -374,7 +410,7 @@ func saveImageLocally(data []byte) (string, error) {
 
 	// 使用新的获取公网 IP 的方法
 	publicIP := getPublicIP()
-	
+
 	newURL := fmt.Sprintf("http://%s:%s/images/%s",
 		publicIP,
 		os.Getenv("SERVER_PORT"),
@@ -397,12 +433,23 @@ func forwardResponse(w http.ResponseWriter, resp *http.Response) error {
 	// 如果不支持流式响应，使用普通响应
 	if !canFlush {
 		w.WriteHeader(resp.StatusCode)
-		_, err := io.Copy(w, resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+
+		// 重新排序响应
+		orderedBody, err := reorderResponse(body)
+		if err != nil {
+			return err
+		}
+
+		_, err = w.Write(orderedBody)
 		return err
 	}
 
 	// 流式响应处理
-	w.Header().Del("Content-Length") // 流式响应不需要 Content-Length
+	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 	flusher.Flush()
 
@@ -412,7 +459,16 @@ func forwardResponse(w http.ResponseWriter, resp *http.Response) error {
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+			chunk := buf[:n]
+			// 对于流式响应，我们需要检查并处理每个数据块
+			if bytes.Contains(chunk, []byte("{")) && bytes.Contains(chunk, []byte("}")) {
+				orderedChunk, err := reorderResponse(chunk)
+				if err == nil {
+					chunk = orderedChunk
+				}
+			}
+
+			if _, werr := w.Write(chunk); werr != nil {
 				return fmt.Errorf("写入响应失败: %v", werr)
 			}
 			flusher.Flush()
